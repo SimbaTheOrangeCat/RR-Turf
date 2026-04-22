@@ -1,16 +1,27 @@
 import Image from "next/image";
+import Link from "next/link";
+import { logoutAction } from "@/app/auth/actions";
+import { createClient } from "@/lib/supabase/server";
+import { hasSupabaseEnv } from "@/lib/supabase/env";
 
-export default function Home() {
+export default async function Home() {
+  const supabaseReady = hasSupabaseEnv();
+  let user: { id: string } | null = null;
+  let profile: { role: string } | null = null;
+
+  if (supabaseReady) {
+    const supabase = await createClient();
+    const authResult = await supabase.auth.getUser();
+    user = authResult.data.user ? { id: authResult.data.user.id } : null;
+    profile = user ? (await supabase.from("profiles").select("role").eq("id", user.id).single()).data : null;
+  }
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <header className="sticky top-0 z-20 border-b border-white/10 bg-slate-950/90 backdrop-blur">
         <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-6 py-4">
           <div className="flex items-center gap-2">
-            <span className="inline-flex items-center gap-1 rounded-full border border-emerald-300/40 bg-emerald-300/10 px-3 py-1 text-sm">
-              <span className="animate-pulse">🏏</span>
-              <span className="animate-bounce">⚽</span>
-            </span>
-            <p className="text-xl font-black tracking-tight">rrTurf</p>
+            <p className="text-xl font-black tracking-tight">RR Turf</p>
           </div>
           <nav className="hidden items-center gap-6 text-sm text-slate-300 md:flex">
             <a href="#sports" className="transition hover:text-emerald-300">
@@ -24,12 +35,41 @@ export default function Home() {
             </a>
           </nav>
           <div className="flex items-center gap-2">
-            <button className="rounded-full border border-white/20 px-4 py-2 text-sm font-semibold transition hover:border-emerald-300 hover:text-emerald-200">
-              Sign In
-            </button>
-            <button className="rounded-full bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-300">
-              Sign Up
-            </button>
+            {user ? (
+              <>
+                {profile?.role === "admin" ? (
+                  <Link
+                    href="/admin/availability"
+                    className="rounded-full border border-white/20 px-4 py-2 text-sm font-semibold transition hover:border-emerald-300 hover:text-emerald-200"
+                  >
+                    Admin
+                  </Link>
+                ) : null}
+                <form action={logoutAction}>
+                  <button
+                    type="submit"
+                    className="rounded-full bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-300"
+                  >
+                    Logout
+                  </button>
+                </form>
+              </>
+            ) : (
+              <>
+                <Link
+                  href={supabaseReady ? "/login" : "#booking"}
+                  className="rounded-full border border-white/20 px-4 py-2 text-sm font-semibold transition hover:border-emerald-300 hover:text-emerald-200"
+                >
+                  Sign In
+                </Link>
+                <Link
+                  href={supabaseReady ? "/signup" : "#booking"}
+                  className="rounded-full bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-300"
+                >
+                  Sign Up
+                </Link>
+              </>
+            )}
           </div>
         </div>
       </header>
@@ -41,19 +81,25 @@ export default function Home() {
               Artificial Turf Ground
             </p>
             <h1 className="text-4xl font-extrabold leading-tight sm:text-5xl">
-              Play Football and Cricket at rrTurf
+              Play Football and Cricket at RR Turf
             </h1>
             <p className="max-w-xl text-slate-300">
               Premium turf experience with easy advance booking, prime-time
               slots, and a clean, safe playing environment for your team.
             </p>
             <div className="flex flex-wrap items-center gap-3">
-              <button className="rounded-full bg-emerald-400 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-emerald-300">
+              <Link
+                href={supabaseReady ? (user ? "/availability" : "/login?next=/availability") : "#booking"}
+                className="rounded-full bg-emerald-400 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-emerald-300"
+              >
                 Check Availability
-              </button>
-              <button className="rounded-full border border-white/20 px-5 py-3 text-sm font-semibold text-slate-100 transition hover:border-emerald-300 hover:text-emerald-200">
+              </Link>
+              <Link
+                href="/facilities"
+                className="rounded-full border border-white/20 px-5 py-3 text-sm font-semibold text-slate-100 transition hover:border-emerald-300 hover:text-emerald-200"
+              >
                 Explore Facilities
-              </button>
+              </Link>
             </div>
           </div>
 
@@ -77,7 +123,7 @@ export default function Home() {
             <div className="mt-8 grid gap-5 md:grid-cols-2">
               <article className="rounded-2xl border border-white/10 bg-slate-950/70 p-6">
                 <p className="text-sm font-semibold text-emerald-200">Football</p>
-                <h3 className="mt-2 text-xl font-semibold">Football</h3>
+                <h3 className="mt-2 text-xl font-semibold">Net and Match Play</h3>
                 <p className="mt-3 text-sm text-slate-300">
                   Practice matches, friendly games, or team training on quality
                   artificial grass.
@@ -100,6 +146,11 @@ export default function Home() {
           <div className="mt-4 rounded-xl border border-emerald-300/30 bg-emerald-300/10 p-4 text-sm font-semibold text-emerald-100">
             Sign In or Sign Up is required before making a booking inquiry.
           </div>
+          {!supabaseReady ? (
+            <div className="mt-3 rounded-xl border border-amber-300/30 bg-amber-300/10 p-4 text-sm font-semibold text-amber-100">
+              Booking system setup pending. Add Supabase keys in `.env.local` and run the SQL in `supabase/schema.sql`.
+            </div>
+          ) : null}
           <div className="mt-8 grid gap-4 md:grid-cols-3">
             <div className="rounded-2xl border border-white/10 bg-slate-900/70 p-5">
               <p className="text-sm font-semibold text-emerald-200">Step 1</p>
@@ -116,7 +167,7 @@ export default function Home() {
             <div className="rounded-2xl border border-white/10 bg-slate-900/70 p-5">
               <p className="text-sm font-semibold text-emerald-200">Step 3</p>
               <p className="mt-2 text-sm text-slate-200">
-                Receive confirmation from rrTurf management.
+                Receive confirmation from RR Turf management.
               </p>
             </div>
           </div>
@@ -127,7 +178,7 @@ export default function Home() {
         <div className="mx-auto flex w-full max-w-6xl flex-col gap-4 px-6 py-10 md:flex-row md:items-center md:justify-between">
           <div>
             <p className="text-lg font-extrabold text-white">
-              rrTurf - Book in advance. Play hassle-free.
+              RR Turf - Book in advance. Play hassle-free.
             </p>
             <p className="mt-1 text-sm font-semibold text-slate-300">
               Contact: +91 90000 00000 | rrturf@example.com

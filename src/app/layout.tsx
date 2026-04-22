@@ -13,9 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "rrTurf | Football & Cricket Turf Booking",
+  title: "RR Turf | Football & Cricket Turf Booking",
   description:
-    "rrTurf is an artificial turf ground for Football and Cricket with advance slot booking.",
+    "RR Turf is an artificial turf ground for Football and Cricket with advance slot booking.",
 };
 
 export default function RootLayout({
