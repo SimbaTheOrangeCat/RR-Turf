@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
-import { cancelBookingAction, bookSlotAction, modifyBookingAction } from "./actions";
+import { cancelBookingAction, modifyBookingAction } from "./actions";
 import { formatTime, getTodayDateString } from "@/lib/booking/utils";
 import { logoutAction } from "@/app/auth/actions";
 import { createClient } from "@/lib/supabase/server";
@@ -14,6 +14,9 @@ type AvailabilityPageProps = {
 export default async function AvailabilityPage({ searchParams }: AvailabilityPageProps) {
   const params = await searchParams;
   const selectedDate = params.date ?? getTodayDateString();
+  const paymentsEnabled = Boolean(
+    process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET && process.env.SUPABASE_SERVICE_ROLE_KEY,
+  );
 
   if (!hasSupabaseEnv()) {
     return (
@@ -139,8 +142,10 @@ export default async function AvailabilityPage({ searchParams }: AvailabilityPag
           </div>
 
           <ProgressiveBookingWizard
+            key={selectedDate}
             selectedDate={selectedDate}
             minDate={getTodayDateString()}
+            paymentsEnabled={paymentsEnabled}
             slots={
               (slots ?? []).map((slot) => ({
                 id: slot.id,
@@ -149,7 +154,6 @@ export default async function AvailabilityPage({ searchParams }: AvailabilityPag
                 status: slot.status,
               })) ?? []
             }
-            action={bookSlotAction}
           />
         </section>
 

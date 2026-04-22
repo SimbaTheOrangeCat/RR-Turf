@@ -1,7 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { formatTime } from "@/lib/booking/utils";
+import type { RazorpayCheckoutSuccess } from "@/types/razorpay-checkout";
 
 const FOOD_MENU_ITEMS = [
   "Maggi",
@@ -22,35 +24,181 @@ type SlotOption = {
 type ProgressiveBookingWizardProps = {
   selectedDate: string;
   minDate: string;
+  paymentsEnabled: boolean;
   slots: SlotOption[];
-  action: (formData: FormData) => void | Promise<void>;
 };
+
+let razorpayScriptPromise: Promise<void> | null = null;
+
+function loadRazorpayScript(): Promise<void> {
+  if (typeof window === "undefined") {
+    return Promise.resolve();
+  }
+  if (window.Razorpay) {
+    return Promise.resolve();
+  }
+  if (!razorpayScriptPromise) {
+    razorpayScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://checkout.razorpay.com/v1/checkout.js";
+      script.async = true;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error("Could not load Razorpay Checkout"));
+      document.body.appendChild(script);
+    });
+  }
+  return razorpayScriptPromise;
+}
 
 export default function ProgressiveBookingWizard({
   selectedDate,
   minDate,
+  paymentsEnabled,
   slots,
-  action,
 }: ProgressiveBookingWizardProps) {
+  const router = useRouter();
+  const formRef = useRef<HTMLFormElement>(null);
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [dateInput, setDateInput] = useState(selectedDate);
   const [selectedSlotId, setSelectedSlotId] = useState("");
   const [foodPreference, setFoodPreference] = useState<"yes" | "no">("no");
-  const [paymentConfirmed, setPaymentConfirmed] = useState(false);
-
-  useEffect(() => {
-    setDateInput(selectedDate);
-    setStep(1);
-    setSelectedSlotId("");
-    setFoodPreference("no");
-    setPaymentConfirmed(false);
-  }, [selectedDate]);
+  const [paymentPhase, setPaymentPhase] = useState<"idle" | "creating" | "checkout" | "verifying">("idle");
+  const [paymentMessage, setPaymentMessage] = useState<string | null>(null);
 
   const selectedSlot = useMemo(
     () => slots.find((slot) => slot.id === selectedSlotId),
     [slots, selectedSlotId],
   );
   const slotAvailable = selectedSlot?.status === "available";
+
+  const publicKeyId = process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID;
+
+  const handlePay = useCallback(async () => {
+    setPaymentMessage(null);
+    if (!paymentsEnabled || !publicKeyId) {
+      setPaymentMessage("Payments are not configured on the server. Add Razorpay and Supabase service keys.");
+      return;
+    }
+    const form = formRef.current;
+    if (!form || !selectedSlot) {
+      return;
+    }
+
+    const fd = new FormData(form);
+    const customerName = String(fd.get("customerName") ?? "").trim();
+    const phone = String(fd.get("phone") ?? "").trim();
+    const contactEmail = String(fd.get("contactEmail") ?? "").trim();
+    const wantsFood = String(fd.get("foodPreference") ?? "") === "yes";
+    const foodItems = fd.getAll("foodItems").map((item) => String(item)).filter(Boolean);
+
+    if (!customerName) {
+      setPaymentMessage("Name is required.");
+      return;
+    }
+    if (!phone) {
+      setPaymentMessage("Phone number is required.");
+      return;
+    }
+    if (wantsFood && foodItems.length === 0) {
+      setPaymentMessage("Please select at least one food item or choose No for food preference.");
+      return;
+    }
+
+    setPaymentPhase("creating");
+    try {
+      const createRes = await fetch("/api/payments/razorpay/create-order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          slotId: selectedSlot.id,
+          customerName,
+          phone,
+          contactEmail,
+          wantsFood,
+          foodItems: wantsFood ? foodItems : [],
+        }),
+      });
+      const createJson = (await createRes.json()) as {
+        error?: string;
+        sessionId?: string;
+        orderId?: string;
+        amount?: number;
+        currency?: string;
+        keyId?: string;
+      };
+      if (!createRes.ok) {
+        throw new Error(createJson.error ?? "Could not start payment");
+      }
+      const { sessionId, orderId, amount, currency, keyId } = createJson;
+      if (!sessionId || !orderId || amount == null || !currency || !keyId) {
+        throw new Error("Invalid response from payment server");
+      }
+
+      await loadRazorpayScript();
+      if (!window.Razorpay) {
+        throw new Error("Razorpay Checkout is unavailable");
+      }
+
+      setPaymentPhase("checkout");
+
+      const verifyThenFinish = async (response: RazorpayCheckoutSuccess) => {
+        setPaymentPhase("verifying");
+        const verifyRes = await fetch("/api/payments/razorpay/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({
+            sessionId,
+            razorpay_order_id: response.razorpay_order_id,
+            razorpay_payment_id: response.razorpay_payment_id,
+            razorpay_signature: response.razorpay_signature,
+          }),
+        });
+        const verifyJson = (await verifyRes.json()) as { error?: string };
+        if (!verifyRes.ok) {
+          throw new Error(verifyJson.error ?? "Could not verify payment");
+        }
+        router.push(
+          `/availability?date=${encodeURIComponent(selectedDate)}&success=${encodeURIComponent("Slot booked successfully after payment")}`,
+        );
+        router.refresh();
+      };
+
+      const rzp = new window.Razorpay({
+        key: keyId,
+        amount,
+        currency,
+        name: "RR Turf",
+        description: "Advance payment (non-refundable)",
+        order_id: orderId,
+        prefill: {
+          name: customerName,
+          contact: phone,
+          email: contactEmail || undefined,
+        },
+        handler: (response: RazorpayCheckoutSuccess) => {
+          void verifyThenFinish(response).catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : "Verification failed";
+            setPaymentMessage(msg);
+            setPaymentPhase("idle");
+          });
+        },
+        modal: {
+          ondismiss: () => {
+            setPaymentPhase("idle");
+            setPaymentMessage("Payment window closed. You can try again when ready.");
+          },
+        },
+      });
+
+      rzp.open();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Payment could not start";
+      setPaymentMessage(msg);
+      setPaymentPhase("idle");
+    }
+  }, [paymentsEnabled, publicKeyId, router, selectedDate, selectedSlot]);
 
   return (
     <div className="mt-6 rounded-2xl border border-white/10 bg-slate-950/50 p-5">
@@ -155,11 +303,14 @@ export default function ProgressiveBookingWizard({
       ) : null}
 
       {(step === 3 || step === 4) && selectedSlot ? (
-        <form action={action} className="space-y-3">
+        <form
+          ref={formRef}
+          onSubmit={(event) => event.preventDefault()}
+          className="space-y-3"
+        >
           <input type="hidden" name="slotId" value={selectedSlot.id} />
           <input type="hidden" name="date" value={selectedDate} />
 
-          {/* Keep detail fields mounted on step 4 so server action still receives name/phone/email/food */}
           <div className={step === 4 ? "hidden" : "space-y-3"}>
             <div className="grid gap-2">
               <label className="text-xs font-semibold text-slate-300">Name *</label>
@@ -253,40 +404,52 @@ export default function ProgressiveBookingWizard({
               </p>
               <div className="rounded-lg border border-amber-300/30 bg-amber-300/10 p-3">
                 <p className="text-xs font-semibold text-amber-100">
-                  Pay INR 200 advance (non-refundable) to guarantee this slot.
+                  Pay INR 200 advance (non-refundable) to guarantee this slot. Your booking is created only after
+                  Razorpay confirms payment.
                 </p>
-                <div className="mt-2 flex items-center gap-2">
+                <div className="mt-2 flex flex-wrap items-center gap-2">
                   <input
                     value="INR 200 (Non-refundable advance)"
                     readOnly
-                    className="w-full rounded-lg border border-amber-300/40 bg-slate-950 px-3 py-2 text-sm text-amber-100"
+                    className="min-w-0 flex-1 rounded-lg border border-amber-300/40 bg-slate-950 px-3 py-2 text-sm text-amber-100"
                   />
                   <button
                     type="button"
-                    onClick={() => setPaymentConfirmed(true)}
-                    className="rounded-lg border border-amber-300/50 px-3 py-2 text-sm font-semibold text-amber-100 transition hover:border-amber-200"
+                    onClick={() => void handlePay()}
+                    disabled={paymentPhase === "creating" || paymentPhase === "verifying" || !paymentsEnabled}
+                    className="rounded-lg border border-amber-300/50 px-3 py-2 text-sm font-semibold text-amber-100 transition hover:border-amber-200 disabled:cursor-not-allowed disabled:opacity-60"
                   >
-                    Pay
+                    {paymentPhase === "creating"
+                      ? "Starting…"
+                      : paymentPhase === "checkout"
+                        ? "Pay in window…"
+                        : paymentPhase === "verifying"
+                          ? "Confirming…"
+                          : "Pay with Razorpay"}
                   </button>
                 </div>
-                <p className="mt-2 text-xs text-amber-100">
-                  {paymentConfirmed ? "Payment step marked complete." : "Click Pay to continue."}
-                </p>
+                {!paymentsEnabled ? (
+                  <p className="mt-2 text-xs text-amber-200">
+                    Payments need{" "}
+                    <code className="rounded bg-slate-950/80 px-1">NEXT_PUBLIC_RAZORPAY_KEY_ID</code>,{" "}
+                    <code className="rounded bg-slate-950/80 px-1">RAZORPAY_KEY_SECRET</code>, and{" "}
+                    <code className="rounded bg-slate-950/80 px-1">SUPABASE_SERVICE_ROLE_KEY</code> in the server
+                    environment.
+                  </p>
+                ) : null}
+                {paymentMessage ? <p className="mt-2 text-xs text-red-200">{paymentMessage}</p> : null}
               </div>
               <div className="flex gap-2">
                 <button
                   type="button"
-                  onClick={() => setStep(3)}
+                  onClick={() => {
+                    setPaymentPhase("idle");
+                    setPaymentMessage(null);
+                    setStep(3);
+                  }}
                   className="rounded-lg border border-white/20 px-4 py-2 text-sm font-semibold"
                 >
                   Back
-                </button>
-                <button
-                  type="submit"
-                  disabled={!paymentConfirmed}
-                  className="rounded-lg bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  Confirm Booking
                 </button>
               </div>
             </div>

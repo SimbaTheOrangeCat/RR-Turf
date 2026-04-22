@@ -34,6 +34,8 @@ alter table public.bookings add column if not exists contact_email text;
 alter table public.bookings add column if not exists food_items text[] not null default '{}';
 alter table public.bookings add column if not exists advance_payment_amount integer not null default 200;
 alter table public.bookings add column if not exists payment_status text not null default 'pending';
+alter table public.bookings add column if not exists razorpay_order_id text;
+alter table public.bookings add column if not exists razorpay_payment_id text;
 
 create unique index if not exists bookings_one_active_per_slot_idx
   on public.bookings (slot_id)
@@ -140,12 +142,15 @@ using (
   )
 );
 
-create or replace function public.book_slot(
+create or replace function public.book_slot_for_user(
+  p_user_id uuid,
   p_slot_id uuid,
   p_customer_name text,
   p_phone text,
   p_contact_email text default null,
-  p_food_items text[] default '{}'
+  p_food_items text[] default '{}',
+  p_razorpay_order_id text default null,
+  p_razorpay_payment_id text default null
 )
 returns uuid
 language plpgsql
@@ -153,13 +158,13 @@ security definer
 set search_path = public
 as $$
 declare
-  v_user_id uuid := auth.uid();
   v_booking_id uuid;
   v_slot_status text;
   v_existing_booking uuid;
+  v_payment_status text;
 begin
-  if v_user_id is null then
-    raise exception 'Not authenticated';
+  if p_user_id is null then
+    raise exception 'User is required';
   end if;
 
   if p_customer_name is null or length(trim(p_customer_name)) = 0 then
@@ -169,6 +174,11 @@ begin
   if p_phone is null or length(trim(p_phone)) = 0 then
     raise exception 'Phone number is required';
   end if;
+
+  v_payment_status := case
+    when p_razorpay_payment_id is not null and length(trim(p_razorpay_payment_id)) > 0 then 'paid'
+    else 'pending'
+  end;
 
   select status into v_slot_status
   from public.time_slots
@@ -207,23 +217,63 @@ begin
     customer_name,
     phone,
     contact_email,
-    food_items
+    food_items,
+    payment_status,
+    razorpay_order_id,
+    razorpay_payment_id
   )
   values (
-    v_user_id,
+    p_user_id,
     p_slot_id,
     'active',
     trim(p_customer_name),
     trim(p_phone),
     nullif(trim(coalesce(p_contact_email, '')), ''),
-    coalesce(p_food_items, '{}')
+    coalesce(p_food_items, '{}'),
+    v_payment_status,
+    nullif(trim(coalesce(p_razorpay_order_id, '')), ''),
+    nullif(trim(coalesce(p_razorpay_payment_id, '')), '')
   )
   returning id into v_booking_id;
 
   insert into public.booking_history (booking_id, action, new_slot_id, acted_by)
-  values (v_booking_id, 'created', p_slot_id, v_user_id);
+  values (v_booking_id, 'created', p_slot_id, p_user_id);
 
   return v_booking_id;
+end;
+$$;
+
+create or replace function public.book_slot(
+  p_slot_id uuid,
+  p_customer_name text,
+  p_phone text,
+  p_contact_email text default null,
+  p_food_items text[] default '{}',
+  p_razorpay_order_id text default null,
+  p_razorpay_payment_id text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid uuid := auth.uid();
+begin
+  if v_uid is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  return public.book_slot_for_user(
+    v_uid,
+    p_slot_id,
+    p_customer_name,
+    p_phone,
+    p_contact_email,
+    p_food_items,
+    p_razorpay_order_id,
+    p_razorpay_payment_id
+  );
 end;
 $$;
 
@@ -336,6 +386,166 @@ begin
 end;
 $$;
 
-grant execute on function public.book_slot(uuid, text, text, text, text[]) to authenticated;
+grant execute on function public.book_slot(uuid, text, text, text, text[], text, text) to authenticated;
 grant execute on function public.cancel_booking(uuid) to authenticated;
 grant execute on function public.modify_booking(uuid, uuid) to authenticated;
+
+-- Checkout state: written only from trusted server (service role); users may read their own rows.
+create table if not exists public.payment_sessions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  slot_id uuid not null references public.time_slots (id) on delete cascade,
+  amount_paise integer not null,
+  currency text not null default 'INR',
+  customer_name text not null,
+  phone text not null,
+  contact_email text,
+  food_items text[] not null default '{}',
+  razorpay_order_id text not null,
+  status text not null default 'created' check (status in ('created', 'paid', 'failed', 'expired')),
+  expires_at timestamptz not null,
+  booking_id uuid references public.bookings (id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists payment_sessions_user_id_idx on public.payment_sessions (user_id);
+create index if not exists payment_sessions_razorpay_order_id_idx on public.payment_sessions (razorpay_order_id);
+
+alter table public.payment_sessions enable row level security;
+
+drop policy if exists "payment_sessions_select_own" on public.payment_sessions;
+create policy "payment_sessions_select_own"
+on public.payment_sessions for select
+using (auth.uid() = user_id);
+
+create or replace function public.finalize_booking_payment_session(
+  p_session_id uuid,
+  p_razorpay_order_id text,
+  p_razorpay_payment_id text
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid uuid := auth.uid();
+  s public.payment_sessions%rowtype;
+  v_booking_id uuid;
+begin
+  if v_uid is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  select * into s
+  from public.payment_sessions
+  where id = p_session_id
+  for update;
+
+  if not found then
+    raise exception 'Payment session not found';
+  end if;
+
+  if s.user_id <> v_uid then
+    raise exception 'Unauthorized';
+  end if;
+
+  if s.status = 'paid' and s.booking_id is not null then
+    return s.booking_id;
+  end if;
+
+  if s.status <> 'created' then
+    raise exception 'Payment session is not payable';
+  end if;
+
+  if s.expires_at < now() then
+    update public.payment_sessions set status = 'expired' where id = p_session_id;
+    raise exception 'Payment session expired';
+  end if;
+
+  if s.razorpay_order_id is distinct from p_razorpay_order_id then
+    raise exception 'Order mismatch';
+  end if;
+
+  v_booking_id := public.book_slot_for_user(
+    s.user_id,
+    s.slot_id,
+    s.customer_name,
+    s.phone,
+    s.contact_email,
+    s.food_items,
+    p_razorpay_order_id,
+    p_razorpay_payment_id
+  );
+
+  update public.payment_sessions
+  set status = 'paid', booking_id = v_booking_id
+  where id = p_session_id;
+
+  return v_booking_id;
+end;
+$$;
+
+create or replace function public.finalize_booking_by_order_webhook(
+  p_razorpay_order_id text,
+  p_razorpay_payment_id text
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  s public.payment_sessions%rowtype;
+  v_booking_id uuid;
+begin
+  select * into s
+  from public.payment_sessions
+  where razorpay_order_id = p_razorpay_order_id
+  for update;
+
+  if not found then
+    return null;
+  end if;
+
+  if s.status = 'paid' and s.booking_id is not null then
+    return s.booking_id;
+  end if;
+
+  if s.status <> 'created' then
+    return null;
+  end if;
+
+  if s.expires_at < now() then
+    update public.payment_sessions set status = 'expired' where id = s.id;
+    return null;
+  end if;
+
+  v_booking_id := public.book_slot_for_user(
+    s.user_id,
+    s.slot_id,
+    s.customer_name,
+    s.phone,
+    s.contact_email,
+    s.food_items,
+    p_razorpay_order_id,
+    p_razorpay_payment_id
+  );
+
+  update public.payment_sessions
+  set status = 'paid', booking_id = v_booking_id
+  where id = s.id;
+
+  return v_booking_id;
+end;
+$$;
+
+revoke all on function public.book_slot_for_user(uuid, uuid, text, text, text, text[], text, text) from public;
+grant execute on function public.book_slot_for_user(uuid, uuid, text, text, text, text[], text, text) to service_role;
+
+grant execute on function public.finalize_booking_payment_session(uuid, text, text) to authenticated;
+revoke all on function public.finalize_booking_payment_session(uuid, text, text) from public;
+grant execute on function public.finalize_booking_payment_session(uuid, text, text) to service_role;
+
+revoke all on function public.finalize_booking_by_order_webhook(text, text) from public;
+grant execute on function public.finalize_booking_by_order_webhook(text, text) to service_role;
