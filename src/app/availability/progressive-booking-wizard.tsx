@@ -2,6 +2,7 @@
 
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { customerNameBookingError, phoneBookingError } from "@/lib/booking/contact-validation";
 import { formatTime } from "@/lib/booking/utils";
 import type { RazorpayCheckoutSuccess } from "@/types/razorpay-checkout";
 
@@ -64,6 +65,11 @@ export default function ProgressiveBookingWizard({
   const [foodPreference, setFoodPreference] = useState<"yes" | "no">("no");
   const [paymentPhase, setPaymentPhase] = useState<"idle" | "creating" | "checkout" | "verifying">("idle");
   const [paymentMessage, setPaymentMessage] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<{ name: string; phone: string; food: string }>({
+    name: "",
+    phone: "",
+    food: "",
+  });
 
   const selectedSlot = useMemo(
     () => slots.find((slot) => slot.id === selectedSlotId),
@@ -91,18 +97,25 @@ export default function ProgressiveBookingWizard({
     const wantsFood = String(fd.get("foodPreference") ?? "") === "yes";
     const foodItems = fd.getAll("foodItems").map((item) => String(item)).filter(Boolean);
 
-    if (!customerName) {
-      setPaymentMessage("Name is required.");
+    const nameErr = customerNameBookingError(customerName);
+    const phoneErr = phoneBookingError(phone);
+    const foodErr =
+      wantsFood && foodItems.length === 0
+        ? "Please select at least one food item or choose No for food preference."
+        : null;
+
+    if (nameErr || phoneErr || foodErr) {
+      setFieldErrors({
+        name: nameErr ?? "",
+        phone: phoneErr ?? "",
+        food: foodErr ?? "",
+      });
+      setStep(3);
+      setPaymentMessage(null);
       return;
     }
-    if (!phone) {
-      setPaymentMessage("Phone number is required.");
-      return;
-    }
-    if (wantsFood && foodItems.length === 0) {
-      setPaymentMessage("Please select at least one food item or choose No for food preference.");
-      return;
-    }
+
+    setFieldErrors({ name: "", phone: "", food: "" });
 
     setPaymentPhase("creating");
     try {
@@ -285,14 +298,20 @@ export default function ProgressiveBookingWizard({
           <div className="flex gap-2">
             <button
               type="button"
-              onClick={() => setStep(1)}
+              onClick={() => {
+                setFieldErrors({ name: "", phone: "", food: "" });
+                setStep(1);
+              }}
               className="rounded-lg border border-white/20 px-4 py-2 text-sm font-semibold"
             >
               Back
             </button>
             <button
               type="button"
-              onClick={() => setStep(3)}
+              onClick={() => {
+                setFieldErrors({ name: "", phone: "", food: "" });
+                setStep(3);
+              }}
               disabled={!slotAvailable || slots.length === 0}
               className="rounded-lg bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 disabled:cursor-not-allowed disabled:opacity-60"
             >
@@ -317,17 +336,37 @@ export default function ProgressiveBookingWizard({
               <input
                 name="customerName"
                 required
+                autoComplete="name"
                 className="rounded-lg border border-white/20 bg-slate-950 px-3 py-2 text-sm"
+                onChange={(event) => {
+                  event.currentTarget.value = event.currentTarget.value.replace(/\d/g, "");
+                  if (fieldErrors.name) {
+                    setFieldErrors((prev) => ({ ...prev, name: "" }));
+                  }
+                }}
               />
+              {fieldErrors.name ? <p className="text-xs text-red-300">{fieldErrors.name}</p> : null}
             </div>
             <div className="grid gap-2">
-              <label className="text-xs font-semibold text-slate-300">Phone Number *</label>
+              <label className="text-xs font-semibold text-slate-300">Phone Number * (10 digits)</label>
               <input
                 name="phone"
                 type="tel"
                 required
+                inputMode="numeric"
+                autoComplete="tel"
+                maxLength={10}
+                placeholder="9876543210"
+                title="Enter exactly 10 digits, numbers only"
                 className="rounded-lg border border-white/20 bg-slate-950 px-3 py-2 text-sm"
+                onChange={(event) => {
+                  event.currentTarget.value = event.currentTarget.value.replace(/\D/g, "").slice(0, 10);
+                  if (fieldErrors.phone) {
+                    setFieldErrors((prev) => ({ ...prev, phone: "" }));
+                  }
+                }}
               />
+              {fieldErrors.phone ? <p className="text-xs text-red-300">{fieldErrors.phone}</p> : null}
             </div>
             <div className="grid gap-2">
               <label className="text-xs font-semibold text-slate-300">Email (optional)</label>
@@ -346,7 +385,10 @@ export default function ProgressiveBookingWizard({
                     name="foodPreference"
                     value="yes"
                     checked={foodPreference === "yes"}
-                    onChange={() => setFoodPreference("yes")}
+                    onChange={() => {
+                      setFoodPreference("yes");
+                      setFieldErrors((prev) => ({ ...prev, food: "" }));
+                    }}
                   />
                   Yes
                 </label>
@@ -356,7 +398,10 @@ export default function ProgressiveBookingWizard({
                     name="foodPreference"
                     value="no"
                     checked={foodPreference === "no"}
-                    onChange={() => setFoodPreference("no")}
+                    onChange={() => {
+                      setFoodPreference("no");
+                      setFieldErrors((prev) => ({ ...prev, food: "" }));
+                    }}
                   />
                   No
                 </label>
@@ -377,18 +422,50 @@ export default function ProgressiveBookingWizard({
                   ))}
                 </div>
               </div>
+              {fieldErrors.food ? <p className="text-xs text-red-300">{fieldErrors.food}</p> : null}
             </div>
             <div className="flex gap-2">
               <button
                 type="button"
-                onClick={() => setStep(2)}
+                onClick={() => {
+                  setFieldErrors({ name: "", phone: "", food: "" });
+                  setStep(2);
+                }}
                 className="rounded-lg border border-white/20 px-4 py-2 text-sm font-semibold"
               >
                 Back
               </button>
               <button
                 type="button"
-                onClick={() => setStep(4)}
+                onClick={() => {
+                  const form = formRef.current;
+                  if (!form) return;
+                  const fd = new FormData(form);
+                  const customerName = String(fd.get("customerName") ?? "").trim();
+                  const phone = String(fd.get("phone") ?? "").trim();
+                  const wantsFood = String(fd.get("foodPreference") ?? "") === "yes";
+                  const foodItems = fd.getAll("foodItems").map((item) => String(item)).filter(Boolean);
+
+                  const nameErr = customerNameBookingError(customerName);
+                  const phoneErr = phoneBookingError(phone);
+                  const foodErr =
+                    wantsFood && foodItems.length === 0
+                      ? "Please select at least one food item or choose No for food preference."
+                      : "";
+
+                  setFieldErrors({
+                    name: nameErr ?? "",
+                    phone: phoneErr ?? "",
+                    food: foodErr,
+                  });
+
+                  if (nameErr || phoneErr || foodErr) {
+                    return;
+                  }
+
+                  setFieldErrors({ name: "", phone: "", food: "" });
+                  setStep(4);
+                }}
                 className="rounded-lg bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950"
               >
                 Continue to Payment
@@ -445,6 +522,7 @@ export default function ProgressiveBookingWizard({
                   onClick={() => {
                     setPaymentPhase("idle");
                     setPaymentMessage(null);
+                    setFieldErrors({ name: "", phone: "", food: "" });
                     setStep(3);
                   }}
                   className="rounded-lg border border-white/20 px-4 py-2 text-sm font-semibold"

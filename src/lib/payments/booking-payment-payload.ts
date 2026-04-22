@@ -1,3 +1,5 @@
+import { customerNameBookingError, phoneBookingError } from "@/lib/booking/contact-validation";
+
 export type BookingPaymentPayload = {
   slotId: string;
   customerName: string;
@@ -25,11 +27,13 @@ export function validateBookingPaymentPayload(input: unknown): { ok: true; value
   if (!slotId) {
     return { ok: false, error: "Slot is required" };
   }
-  if (!customerName) {
-    return { ok: false, error: "Name is required" };
+  const nameErr = customerNameBookingError(customerName);
+  if (nameErr) {
+    return { ok: false, error: nameErr };
   }
-  if (!phone) {
-    return { ok: false, error: "Phone number is required" };
+  const phoneErr = phoneBookingError(phone);
+  if (phoneErr) {
+    return { ok: false, error: phoneErr };
   }
   if (wantsFood && foodItems.length === 0) {
     return { ok: false, error: "Please select at least one food item or choose No for food preference" };

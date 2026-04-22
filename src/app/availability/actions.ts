@@ -2,6 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
+import { customerNameBookingError, phoneBookingError } from "@/lib/booking/contact-validation";
 import { buildCustomHourlySlots, buildDateRange, buildHourlySlots } from "@/lib/booking/utils";
 import { createClient } from "@/lib/supabase/server";
 
@@ -198,11 +199,13 @@ export async function bookSlotAction(formData: FormData) {
     .filter(Boolean);
 
   if (!slotId || !date) return;
-  if (!customerName) {
-    redirect(`/availability?date=${date}&error=${encodeURIComponent("Name is required for booking")}`);
+  const nameErr = customerNameBookingError(customerName);
+  if (nameErr) {
+    redirect(`/availability?date=${date}&error=${encodeURIComponent(nameErr)}`);
   }
-  if (!phone) {
-    redirect(`/availability?date=${date}&error=${encodeURIComponent("Phone number is required for booking")}`);
+  const phoneErr = phoneBookingError(phone);
+  if (phoneErr) {
+    redirect(`/availability?date=${date}&error=${encodeURIComponent(phoneErr)}`);
   }
   if (wantsFood && foodItems.length === 0) {
     redirect(
